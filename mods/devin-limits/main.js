@@ -1,0 +1,134 @@
+import { View, div, svg } from "gpui-kit";
+import { h_flex } from "gpui-base";
+import { exec, appHome, theme, settings, shared, setShared } from "herdr";
+
+// Devin CLI Pro plan usage limits: the daily and weekly quota windows.
+// devin_limits.py reads the credentials TOML and prints one JSON line.
+const STATE = "devin-limits"; // shared key: the last good { windows, overageMicros, fetchedAt }
+const POLL_MS = 5 * 60_000;
+const RETRY_MS = 60_000;
+const AFTER_RESET_MS = 15_000;
+const METER_W = 48; // bar size in px, the same as the claude-limits strip
+const METER_H = 6;
+const UPDATING_OPACITY = 0.3;
+const MESSAGES = { not_signed_in: "not signed in", no_quota: "no quota" };
+
+// Time left until a reset: "48m", "4h 48m", "2d 2h".
+function countdown(ms) {
+  const m = Math.max(0, Math.floor(ms / 60_000));
+  if (m < 60) return `${m}m`;
+  if (m < 1440) return `${Math.floor(m / 60)}h ${m % 60}m`;
+  return `${Math.floor(m / 1440)}d ${Math.floor((m % 1440) / 60)}h`;
+}
+
+function age(ms) {
+  const m = Math.max(1, Math.floor(ms / 60_000));
+  return m < 60 ? `${m}m` : m < 1440 ? `${Math.floor(m / 60)}h` : `${Math.floor(m / 1440)}d`;
+}
+
+export default class DevinLimits extends View {
+  init(_props, cx) {
+    this.last = shared(STATE) ?? null; // survives reloads
+    this.error = null; // the latest fetch's error code, null after a success
+    this.busy = false;
+    this.updating = false; // a click is waiting for the running fetch
+    this.clickFailed = false; // the latest fetch was a click's and it failed
+    this.failures = 0;
+    this.nextAt = 0;
+    this.minute = 0;
+    cx.timer.every(5_000, (cx) => this.tick(cx));
+    this.refresh(cx);
+  }
+
+  tick(cx) {
+    const now = Date.now();
+    if (now >= this.nextAt) this.refresh(cx);
+    // Redraw once a minute: stale age, expired windows, "today" vs weekday.
+    const minute = Math.floor(now / 60_000);
+    if (minute !== this.minute) {
+      this.minute = minute;
+      cx.notify();
+    }
+  }
+
+  refresh(cx, clicked = false) {
+    if (clicked && !this.updating) {
+      this.updating = true;
+      cx.notify();
+    }
+    if (this.busy) return;
+    this.busy = true;
+    cx.spawn(async (cx) => {
+      let out;
+      try {
+        const r = await exec("python3", [`${appHome()}/mods/devin-limits/devin_limits.py`], { timeout: 25_000 });
+        out = JSON.parse(r.stdout.trim().split("\n").pop() || "{}");
+      } catch (_e) {
+        out = { error: "failed" };
+      }
+      const now = Date.now();
+      if (out && out.windows && !out.error) {
+        this.last = { windows: out.windows, overageMicros: out.overageMicros, fetchedAt: now };
+        setShared(STATE, this.last);
+        this.error = null;
+        this.clickFailed = false;
+        this.failures = 0;
+        const resets = Object.values(out.windows).map((w) => w.resetsAt * 1000 + AFTER_RESET_MS).filter((t) => t > now);
+        this.nextAt = Math.min(now + POLL_MS, ...resets);
+      } else {
+        this.error = out?.error ?? "failed";
+        this.clickFailed = this.updating;
+        this.failures += 1;
+        this.nextAt = now + Math.min(RETRY_MS * 2 ** (this.failures - 1), POLL_MS);
+      }
+      this.busy = false;
+      this.updating = false;
+      cx.notify();
+    });
+  }
+
+  meter(w, t, now) {
+    const pct = Math.max(0, Math.min(100, w.usedPercent));
+    const level = pct >= 95 ? t.ansi1 : pct >= 80 ? t.ansi3 : null;
+    return h_flex().items_center().gap(6)
+      .child(div().w(METER_W).h(METER_H).flex_none().rounded_full().overflow_hidden().bg(t.border)
+        .child(div().w((METER_W * pct) / 100).h_full().rounded_full().bg(level ?? t.muted)))
+      .child(div().text_color(level ?? t.foreground).child(`${Math.round(pct)}%`))
+      .child(div().text_color(t.foreground).child(countdown(w.resetsAt * 1000 - now)));
+  }
+
+  render() {
+    const t = theme();
+    const s = settings();
+    const size = s.ui_font_size ?? 13;
+    const now = Date.now();
+    const windows = Object.entries(this.last?.windows ?? {})
+      .filter(([, w]) => w.resetsAt * 1000 > now)
+      .sort(([a], [b]) => (a === "day" ? -1 : b === "day" ? 1 : 0));
+    const stale = Boolean(this.error && this.last);
+
+    const row = h_flex().id("codex-limits").size_full().px(14).items_center().gap(8)
+      .bg(t.chrome).border_t(1).border_color(t.border).cursor_pointer()
+      .text_size(size).text_color(t.muted).whitespace_nowrap()
+      .on_click((_e, cx) => this.refresh(cx, true));
+
+    // 0.85 × text size: as wide as the claude-limits ✻, so both strips' bars start at the same x.
+    const logo = svg("mods/devin-limits/devin.svg").size(Math.round(size * 0.85)).flex_none().text_color(t.muted);
+    if (!this.last && this.error) {
+      return row.child(h_flex().items_center().gap(8).opacity(this.updating ? UPDATING_OPACITY : 1)
+        .child(logo).child(MESSAGES[this.error] ?? "unavailable"));
+    }
+
+    const body = h_flex().items_center().gap(8).opacity(this.updating ? UPDATING_OPACITY : stale ? 0.5 : 1)
+      .child(logo)
+      .when(windows.length === 0, (el) => el.child("…"))
+      .children(windows.flatMap(([, w], i) =>
+        [...(i ? [div().text_color(t.dim).child("·")] : []), this.meter(w, t, now)]))
+      .when(this.last?.overageMicros > 0, (el) =>
+        el.child(div().text_color(t.dim).child("·"))
+          .child(div().text_color(t.muted).child(`$${(this.last.overageMicros / 1e6).toFixed(2)}`)));
+    return row.child(body)
+      .when(stale, (el) => el.child(div().text_color(t.dim).child(`· stale ${age(now - this.last.fetchedAt)}`)))
+      .when(this.clickFailed && !this.updating, (el) => el.child(div().text_color(t.dim).child("· update failed")));
+  }
+}
