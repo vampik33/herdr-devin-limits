@@ -4,6 +4,8 @@ A thin strip at the bottom of the [Herdr](https://herdr.dev) desktop app that sh
 your Devin CLI Pro plan's daily and weekly quota, as bars, percent used and the time
 left until each window resets. It also shows the current overage balance.
 
+![devin-limits](preview.png)
+
 ```
 <logo> ━━━━━ 37% 4h 27m · ━━━━━ 18% 2d 2h · $7.08
 ```
