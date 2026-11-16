@@ -4,6 +4,8 @@ A thin full-width strip at the bottom of the window that shows Devin CLI Pro pla
 usage in one line: daily and weekly quota windows, each as a bar, percent used and
 the time left until it resets, followed by the current overage balance.
 
+![Devin limits](preview.png)
+
 ## What you see
 
 One block docked at the bottom of the layout, 26px tall, full window width, `chrome`
